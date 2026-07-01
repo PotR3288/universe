@@ -124,7 +124,28 @@ fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
 
 #[cfg(windows)]
 fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
-    Command::new(binary).args(args).spawn()
+    use std::os::windows::process::CommandExt;
+
+    // CREATE_NO_WINDOW: suppress console window for the child process.
+    // CREATE_BREAKAWAY_FROM_JOB: allow the process to break away from any job object
+    //    the parent is in, preventing the scheduler from throttling it.
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+
+    let child = Command::new(binary)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()?;
+
+    // Set HIGH_PRIORITY_CLASS so the Windows scheduler gives mining threads
+    // preferential CPU time over background / idle work.
+    use windows_sys::Win32::System::Threading::{SetPriorityClass, HIGH_PRIORITY_CLASS};
+    let handle = child.handle();
+    unsafe {
+        let _ = SetPriorityClass(handle, HIGH_PRIORITY_CLASS);
+    }
+
+    Ok(child)
 }
 
 #[cfg(unix)]

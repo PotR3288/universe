@@ -22,6 +22,7 @@
 
 use serde::Serialize;
 
+pub mod available_threads;
 pub mod manager;
 pub mod miners;
 

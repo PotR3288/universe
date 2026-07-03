@@ -20,7 +20,7 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{sync::LazyLock, thread};
+use std::sync::LazyLock;
 
 use log::{error, info};
 use tari_shutdown::Shutdown;
@@ -47,7 +47,7 @@ use crate::{
     internal_wallet::InternalWallet,
     mining::{
         CpuConnectionType, MinerControlsState, MiningError,
-        cpu::{CpuMinerStatus, miners::xmrig::XmrigAdapter},
+        cpu::{available_threads, CpuMinerStatus, miners::xmrig::XmrigAdapter},
         pools::{PoolManagerInterfaceTrait, cpu_pool_manager::CpuPoolManager},
     },
     node::node_adapter::BaseNodeStatus,
@@ -282,26 +282,17 @@ impl CpuManager {
     }
 
     async fn determine_number_of_cores_to_use(cpu_usage_percentage: u32) -> u32 {
-        let max_cpu_available = thread::available_parallelism();
-        let max_cpu_available = match max_cpu_available {
-            Ok(available_cpus) => {
-                info!(target:LOG_TARGET_APP_LOGIC, "Available CPU cores: {available_cpus}");
-                u32::try_from(available_cpus.get()).unwrap_or(1)
-            }
-            Err(err) => {
-                error!("Available CPU cores: Unknown, error: {err}");
-                1
-            }
-        };
+        let max_cpu_available = available_threads::available_parallelism();
+        info!(target: LOG_TARGET_APP_LOGIC, "Available CPU cores (all groups): {max_cpu_available}");
 
         let cpu_cores_to_use = max_cpu_available
-            .saturating_mul(cpu_usage_percentage)
+            .saturating_mul(cpu_usage_percentage as usize)
             .saturating_div(100)
             .clamp(1, max_cpu_available);
 
         info!(target: LOG_TARGET_APP_LOGIC, "Using {cpu_cores_to_use} CPU cores for mining");
 
-        cpu_cores_to_use
+        cpu_cores_to_use as u32
     }
 
     pub async fn stop_mining(&mut self) -> Result<(), anyhow::Error> {

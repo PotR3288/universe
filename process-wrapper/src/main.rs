@@ -125,6 +125,10 @@ fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
 #[cfg(windows)]
 fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
     use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, SetPriorityClass, HIGH_PRIORITY_CLASS, PROCESS_QUERY_INFORMATION,
+    };
 
     // CREATE_NO_WINDOW: suppress console window for the child process.
     // CREATE_BREAKAWAY_FROM_JOB: allow the process to break away from any job object
@@ -139,10 +143,14 @@ fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
 
     // Set HIGH_PRIORITY_CLASS so the Windows scheduler gives mining threads
     // preferential CPU time over background / idle work.
-    use windows_sys::Win32::System::Threading::{SetPriorityClass, HIGH_PRIORITY_CLASS};
-    let handle = child.handle();
+    // Use OpenProcess with child PID instead of Child::handle() which was removed from stable Rust.
+    let pid = child.id();
     unsafe {
-        let _ = SetPriorityClass(handle, HIGH_PRIORITY_CLASS);
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+        if !handle.is_null() {
+            let _ = SetPriorityClass(handle, HIGH_PRIORITY_CLASS);
+            CloseHandle(handle);
+        }
     }
 
     Ok(child)
@@ -201,7 +209,7 @@ fn terminate_child(child: &mut Child) {
 
 #[cfg(windows)]
 fn setup_signal_handlers() {
-    use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_C_EVENT};
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 
     unsafe extern "system" fn console_handler(_ctrl_type: u32) -> i32 {
         SHOULD_TERMINATE.store(true, Ordering::SeqCst);

@@ -22,10 +22,14 @@
 
 //! Process wrapper sidecar for orphan prevention.
 //!
-//! Usage: process-wrapper <parent_pid> <binary> [binary_args...]
+//! Usage: process-wrapper [--group <index>] <parent_pid> <binary> [binary_args...]
 //!
 //! Monitors the parent PID and terminates the child process if the parent dies.
 //! Also handles SIGTERM/SIGINT signals by propagating them to the child.
+//!
+//! On Windows, an optional --group <index> argument binds the process to a specific
+//! processor group via SetProcessGroupAffinity. This is used on systems with >64 CPUs
+//! where each xmrig instance must be bound to exactly one group for huge pages to work.
 //!
 //! On Unix: Creates a new process group and uses it for signal propagation.
 //! On Windows: Uses taskkill with /T for tree termination.
@@ -47,21 +51,49 @@ static SHOULD_TERMINATE: AtomicBool = AtomicBool::new(false);
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 3 {
-        eprintln!("Usage: {} <parent_pid> <binary> [binary_args...]", args[0]);
+    // Parse optional --group <index> argument (Windows only, for multi-group mining)
+    let mut group_index: Option<u16> = None;
+    let mut arg_start = 0usize;
+
+    if args.len() >= 3 && args[1] == "--group" {
+        match args[2].parse::<u16>() {
+            Ok(idx) => {
+                group_index = Some(idx);
+                arg_start = 3; // skip --group <index>
+            }
+            Err(_) => {
+                eprintln!("Invalid group index: {}", args[2]);
+                exit(1);
+            }
+        }
+    }
+
+    let remaining_args = &args[arg_start..];
+
+    if remaining_args.len() < 2 {
+        eprintln!(
+            "Usage: {} [--group <index>] <parent_pid> <binary> [binary_args...]",
+            args[0]
+        );
         exit(1);
     }
 
-    let parent_pid: u32 = match args[1].parse() {
+    let parent_pid: u32 = match remaining_args[0].parse() {
         Ok(pid) => pid,
         Err(_) => {
-            eprintln!("Invalid parent PID: {}", args[1]);
+            eprintln!("Invalid parent PID: {}", remaining_args[0]);
             exit(1);
         }
     };
 
-    let binary = &args[2];
-    let binary_args = &args[3..];
+    let binary = &remaining_args[1];
+    let binary_args = &remaining_args[2..];
+
+    // On Windows, bind to the specified processor group before spawning child
+    #[cfg(windows)]
+    if let Some(group) = group_index {
+        apply_group_affinity(group);
+    }
 
     let mut child = match spawn_child(binary, binary_args) {
         Ok(child) => child,
@@ -104,6 +136,46 @@ fn main() {
                 exit(1);
             }
         }
+    }
+}
+
+/// Apply processor group affinity on Windows.
+///
+/// Binds the current process (and thus its children) to a specific processor group.
+/// This is essential on systems with >64 logical processors where each group has
+/// at most 64 CPUs. Without this, xmrig's huge page allocator fails for threads
+/// outside the default affinity mask.
+#[cfg(windows)]
+fn apply_group_affinity(group: u16) {
+    use windows_sys::Win32::Foundation::GetCurrentProcess;
+    use windows_sys::Win32::System::Threading::{
+        SetProcessGroupAffinity, GROUP_AFFINITY,
+    };
+
+    unsafe {
+        // GetCurrentProcess returns a pseudo-handle (-1 as isize).
+        // This is valid for the lifetime of the process and does not need to be closed.
+        let process_handle = GetCurrentProcess();
+
+        let affinity = GROUP_AFFINITY {
+            Group: group,
+            Reserved: [0; 3],
+            Mask: 0, // OS will compute mask from group membership
+        };
+
+        // SetProcessGroupAffinity returns non-zero on success
+        if SetProcessGroupAffinity(process_handle, 1, &affinity) != 0 {
+            eprintln!(
+                "[process-wrapper] Applied processor group affinity: group={group}"
+            );
+        } else {
+            let err = std::io::Error::last_os_error();
+            eprintln!(
+                "[process-wrapper] Failed to apply processor group affinity: group={group}, error={err}"
+            );
+        }
+
+        // NOTE: process_handle is a pseudo-handle from GetCurrentProcess() — do NOT close it.
     }
 }
 

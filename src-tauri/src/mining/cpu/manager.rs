@@ -57,12 +57,21 @@ use crate::{
     tasks_tracker::TasksTrackers,
 };
 
+#[cfg(windows)]
+use crate::mining::cpu::multi_group_manager::{MultiGroupXmrigManager, get_group_processor_count};
+
 static INSTANCE: LazyLock<RwLock<CpuManager>> = LazyLock::new(|| RwLock::new(CpuManager::new()));
+
+/// Shared shutdown signal for the multi-group status aggregation loop (Windows >64 threads).
+#[cfg(windows)]
+static MULTI_GROUP_SHUTDOWN: LazyLock<Shutdown> = LazyLock::new(|| Shutdown::new());
 
 pub struct CpuManager {
     app_handle: Option<AppHandle>,
     // ======= Process watcher =======
     process_watcher: ProcessWatcher<XmrigAdapter>,
+    #[cfg(windows)]
+    multi_group_manager: std::sync::RwLock<Option<MultiGroupXmrigManager>>,
     // ======= Parameters tracking =======
     status_thread_shutdown: Shutdown,
     process_stats_collector: Sender<ProcessWatcherStats>,
@@ -94,7 +103,16 @@ impl CpuManager {
         Self {
             app_handle: None,
             // ======= Process watcher =======
+<<<<<<< HEAD
             process_watcher,
+=======
+            process_watcher: ProcessWatcher::new(
+                XmrigAdapter::new(Sender::new(CpuMinerStatus::default())),
+                Sender::new(ProcessWatcherStats::default()),
+            ),
+            #[cfg(windows)]
+            multi_group_manager: std::sync::RwLock::new(None),
+>>>>>>> c321f6f3 (xmrig instance per processor group)
             // ======= Parameters tracking =======
             status_thread_shutdown: Shutdown::new(),
             process_stats_collector: Sender::new(ProcessWatcherStats::default()),
@@ -256,6 +274,23 @@ impl CpuManager {
                 self.process_watcher.adapter.extra_options = vec!["--randomx-mode=fast".to_string()]
             }
 
+            // ─── Multi-group detection (Windows >64 threads) ──────────────
+            #[cfg(windows)]
+            {
+                let total_threads = available_threads::available_parallelism();
+                if total_threads > 64 {
+                    info!(target: LOG_TARGET_APP_LOGIC, "Detected {} threads — using multi-group mining", total_threads);
+                    return Self::start_mining_multi_group(
+                        base_path,
+                        log_path,
+                        global_shutdown_signal,
+                        task_tracker,
+                        cpu_usage_percentage,
+                    ).await;
+                }
+            }
+
+            // ─── Single-process path (non-Windows or ≤64 threads) ─────────
             self.process_watcher
                 .start(
                     base_path,
@@ -278,7 +313,133 @@ impl CpuManager {
     }
 
     pub fn is_running(&self) -> bool {
+        #[cfg(windows)]
+        {
+            if let Ok(Some(mgr)) = self.multi_group_manager.try_read() {
+                if mgr.is_running() {
+                    return true;
+                }
+            }
+        }
         self.process_watcher.is_running()
+    }
+
+    /// Start mining using one xmrig process per processor group (Windows >64 threads).
+    #[cfg(windows)]
+    async fn start_mining_multi_group(
+        base_path: PathBuf,
+        log_path: PathBuf,
+        global_shutdown_signal: tari_shutdown::ShutdownSignal,
+        task_tracker: tokio_util::task::TaskTracker,
+        cpu_usage_percentage: u32,
+    ) -> Result<(), anyhow::Error> {
+        use crate::binaries::BinaryResolver;
+
+        let binary = crate::binaries::Binaries::Xmrig;
+        let xmrig_path = BinaryResolver::current().get_binary_path(binary).await?;
+
+        // Build connection-type args shared by all groups from the adapter
+        let adapter = Self::read().await.process_watcher.adapter.clone();
+        let connection_type_args: Vec<String> = match &adapter.connection_type {
+            CpuConnectionType::LocalMMProxy { local_proxy_url } => vec![
+                "--user".to_string(),
+                adapter.address.clone(),
+                "--daemon".to_string(),
+                "--retry-pause=1".to_string(),
+                format!("--url={}", local_proxy_url),
+                "--coin=monero".to_string(),
+            ],
+            CpuConnectionType::Pool { pool_url, worker_name } => {
+                let mut args = vec![];
+                let extended_user_address = match worker_name {
+                    Some(wn) => format!("{}{}", adapter.address.clone(), wn),
+                    None => adapter.address.clone(),
+                };
+                args.push(format!("--url={}", pool_url));
+                args.push("--user".to_string());
+                args.push(extended_user_address);
+                args
+            }
+        };
+
+        // Determine threads per group: total_threads / num_groups, rounded up
+        let total_threads = available_threads::available_parallelism();
+        let num_groups = multi_group_manager::num_groups() as usize;
+        if num_groups == 0 {
+            return Err(anyhow::anyhow!("No processor groups detected"));
+        }
+        let threads_per_group = (total_threads + num_groups - 1) / num_groups;
+        info!(target: LOG_TARGET_APP_LOGIC, "Multi-group mining: {} groups × {} threads/group", num_groups, threads_per_group);
+
+        // Build extra options
+        let extra_options = if cpu_usage_percentage <= 1 {
+            vec!["--randomx-mode=light".to_string()]
+        } else {
+            vec!["--randomx-mode=fast".to_string()]
+        };
+
+        // Create and spawn the multi-group manager
+        let mut mgr = MultiGroupXmrigManager::new(Sender::new(CpuMinerStatus::default()));
+        mgr.spawn(
+            base_path.clone(),
+            log_path,
+            xmrig_path,
+            threads_per_group as u32,
+            connection_type_args,
+            extra_options,
+        )?;
+
+        // Store the manager so stop_mining can shut it down
+        {
+            let mut guard = Self::write().await.multi_group_manager.write().await;
+            *guard = Some(mgr);
+        }
+
+        // Start status aggregation loop
+        Self::start_multi_group_status_aggregation(global_shutdown_signal, task_tracker).await;
+
+        if *ConfigPools::content().await.cpu_pool_enabled() {
+            CpuPoolManager::start_stats_watcher().await;
+        }
+
+        info!(target: LOG_TARGET_APP_LOGIC, "Multi-group CPU mining started ({} groups)", num_groups);
+        Ok(())
+    }
+
+    /// Periodically aggregate status from all xmrig instances and broadcast.
+    #[cfg(windows)]
+    async fn start_multi_group_status_aggregation(
+        global_shutdown_signal: tari_shutdown::ShutdownSignal,
+        task_tracker: tokio_util::task::TaskTracker,
+    ) {
+        use std::time::Duration;
+
+        let mut inner_shutdown = MULTI_GROUP_SHUTDOWN.to_signal();
+
+        task_tracker.spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = inner_shutdown.wait() => {
+                        info!(target: LOG_TARGET_STATUSES, "Shutting down multi-group status aggregation");
+                        break;
+                    }
+                    _ = global_shutdown_signal.clone().wait() => {
+                        info!(target: LOG_TARGET_STATUSES, "Global shutdown — stopping multi-group status aggregation");
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        // Aggregate and broadcast
+                        if let Ok(Some(mgr)) = crate::mining::cpu::manager::CpuManager::read().await.multi_group_manager.try_read() {
+                            let _ = mgr.aggregate_status().await;
+                        }
+                    }
+                }
+            }
+
+            // Note: We do NOT call mgr.stop() here — that would deadlock with stop_mining()
+            // which holds the write lock. Process termination is handled by stop_mining() or
+            // on_app_exit(), and ensure_no_hanging_processes_is_running as a safety net.
+        });
     }
 
     async fn determine_number_of_cores_to_use(cpu_usage_percentage: u32) -> u32 {
@@ -297,6 +458,19 @@ impl CpuManager {
 
     pub async fn stop_mining(&mut self) -> Result<(), anyhow::Error> {
         info!(target: LOG_TARGET_APP_LOGIC, "Stopping cpu miner");
+
+        // ─── Stop multi-group manager (Windows >64 threads) ──────────
+        #[cfg(windows)]
+        {
+            if let Ok(Some(ref mut mgr)) = self.multi_group_manager.try_write() {
+                info!(target: LOG_TARGET_APP_LOGIC, "Stopping multi-group miner");
+                let _ = mgr.stop().await;
+                *mgr = MultiGroupXmrigManager::new(Sender::new(CpuMinerStatus::default()));
+            }
+            MULTI_GROUP_SHUTDOWN.trigger();
+        }
+
+        // ─── Stop single-process miner ────────────────────────────────
         {
             self.process_watcher.status_monitor = None;
             self.process_watcher.stop().await?;
@@ -305,6 +479,7 @@ impl CpuManager {
                 .cpu_external_status_channel
                 .send(CpuMinerStatus::default());
         }
+
         info!(target: LOG_TARGET_APP_LOGIC, "Stopped cpu miner process");
         // Mark mining as stopped in pool manager
         // It will handle stopping the stats watcher after 1 hour of grace period
@@ -317,6 +492,14 @@ impl CpuManager {
     }
 
     pub async fn on_app_exit(&self) {
+        // ─── Clean up multi-group processes (Windows >64 threads) ─────
+        #[cfg(windows)]
+        if let Ok(Some(ref mgr)) = self.multi_group_manager.try_read() {
+            MULTI_GROUP_SHUTDOWN.trigger();
+            let _ = mgr.stop().await;
+        }
+
+        // ─── Clean up single-process miner ────────────────────────────
         match self
             .process_watcher
             .adapter

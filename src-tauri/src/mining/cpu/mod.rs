@@ -25,6 +25,8 @@ use serde::Serialize;
 pub mod available_threads;
 pub mod manager;
 pub mod miners;
+#[cfg(windows)]
+pub mod multi_group_manager;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct CpuMinerStatus {

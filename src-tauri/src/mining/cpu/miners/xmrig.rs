@@ -42,6 +42,7 @@ use crate::process_adapter::{
 use crate::setup::setup_manager::SetupManager;
 use crate::{LOG_TARGET_APP_LOGIC, LOG_TARGET_STATUSES};
 
+#[derive(Clone)]
 pub struct XmrigAdapter {
     pub connection_type: CpuConnectionType,
     pub address: String,

@@ -125,10 +125,6 @@ fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
 #[cfg(windows)]
 fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
     use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        OpenProcess, SetPriorityClass, HIGH_PRIORITY_CLASS, PROCESS_QUERY_INFORMATION,
-    };
 
     // CREATE_NO_WINDOW: suppress console window for the child process.
     // CREATE_BREAKAWAY_FROM_JOB: allow the process to break away from any job object
@@ -136,24 +132,10 @@ fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
 
-    let child = Command::new(binary)
+    Command::new(binary)
         .args(args)
         .creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
-        .spawn()?;
-
-    // Set HIGH_PRIORITY_CLASS so the Windows scheduler gives mining threads
-    // preferential CPU time over background / idle work.
-    // Use OpenProcess with child PID instead of Child::handle() which was removed from stable Rust.
-    let pid = child.id();
-    unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
-        if !handle.is_null() {
-            let _ = SetPriorityClass(handle, HIGH_PRIORITY_CLASS);
-            CloseHandle(handle);
-        }
-    }
-
-    Ok(child)
+        .spawn()
 }
 
 #[cfg(unix)]

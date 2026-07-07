@@ -147,31 +147,42 @@ fn main() {
 /// outside the default affinity mask.
 #[cfg(windows)]
 fn apply_group_affinity(group: u16) {
-    use windows_sys::Win32::Foundation::GetCurrentProcess;
-    use windows_sys::Win32::System::Threading::{
-        SetProcessGroupAffinity, GROUP_AFFINITY,
-    };
+    // The C shim (compiled by build.rs) calls SetProcessGroupAffinity from
+    // kernel32.dll.  This is needed because windows-sys v0.52 doesn't expose
+    // the symbol, and raw FFI alone won't link without the import library.
+
+    #[repr(C)]
+    struct GroupAffinity {
+        group: u16,
+        reserved: [u32; 3],
+        mask: u64,
+    }
+
+    extern "C" {
+        fn shim_set_process_group_affinity(
+            hprocess: *mut std::ffi::c_void,
+            groupcount: u16,
+            affinity: *const GroupAffinity,
+        ) -> i32;
+    }
 
     unsafe {
-        // GetCurrentProcess returns a pseudo-handle (-1 as isize).
-        // This is valid for the lifetime of the process and does not need to be closed.
-        let process_handle = GetCurrentProcess();
+        let process_handle = windows_sys::Win32::System::Threading::GetCurrentProcess();
 
-        let affinity = GROUP_AFFINITY {
-            Group: group,
-            Reserved: [0; 3],
-            Mask: 0, // OS will compute mask from group membership
+        let affinity = GroupAffinity {
+            group,
+            reserved: [0; 3],
+            mask: 0,
         };
 
-        // SetProcessGroupAffinity returns non-zero on success
-        if SetProcessGroupAffinity(process_handle, 1, &affinity) != 0 {
+        if shim_set_process_group_affinity(process_handle, 1, &affinity) != 0 {
             eprintln!(
-                "[process-wrapper] Applied processor group affinity: group={group}"
+                "[process-wrapper] Applied processor group affinity: group={group}",
             );
         } else {
             let err = std::io::Error::last_os_error();
             eprintln!(
-                "[process-wrapper] Failed to apply processor group affinity: group={group}, error={err}"
+                "[process-wrapper] Failed to apply processor group affinity: group={group}, error={err}",
             );
         }
 

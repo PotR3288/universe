@@ -57,20 +57,28 @@ pub fn launch_child_process(
 
     #[cfg(not(target_os = "windows"))]
     {
-        Ok(tokio::process::Command::new(&actual_binary)
+        tokio::process::Command::new(&actual_binary)
             .args(&actual_args)
             .current_dir(current_dir)
             .envs(envs.cloned().unwrap_or_default())
             .stdout(stdout)
             .stderr(stderr)
             .kill_on_drop(true)
-            .spawn()?)
+            .spawn()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to spawn {} (path: {}). This may be caused by missing execute permissions or antivirus blocking.\nError: {}",
+                    actual_binary.file_name().unwrap_or_default().to_string_lossy(),
+                    file_path.display(),
+                    e
+                )
+            })
     }
     #[cfg(target_os = "windows")]
     {
         use crate::consts::PROCESS_CREATION_NO_WINDOW;
 
-        Ok(tokio::process::Command::new(&actual_binary)
+        tokio::process::Command::new(&actual_binary)
             .args(&actual_args)
             .current_dir(current_dir)
             .envs(envs.cloned().unwrap_or_default())
@@ -78,7 +86,15 @@ pub fn launch_child_process(
             .stderr(stderr)
             .kill_on_drop(true)
             .creation_flags(PROCESS_CREATION_NO_WINDOW)
-            .spawn()?)
+            .spawn()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to spawn {} (path: {}). This can happen if antivirus software or SmartScreen is blocking execution. \nTry adding Tari Universe and its data directory to your antivirus exclusions.\nError: {}",
+                    actual_binary.file_name().unwrap_or_default().to_string_lossy(),
+                    file_path.display(),
+                    e
+                )
+            })
     }
 }
 

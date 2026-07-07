@@ -29,6 +29,7 @@
 //! single CpuMinerStatus broadcast.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use log::{info, warn};
@@ -83,7 +84,7 @@ pub struct MultiGroupXmrigManager {
     instances: Vec<XmrigInstance>,
     summary_broadcast: Sender<CpuMinerStatus>,
     /// Shared flag — when triggered all instances shut down.
-    shutdown_signal: Shutdown,
+    shutdown_signal: Mutex<Shutdown>,
 }
 
 impl MultiGroupXmrigManager {
@@ -108,7 +109,7 @@ impl MultiGroupXmrigManager {
         Self {
             instances,
             summary_broadcast,
-            shutdown_signal: Shutdown::new(),
+            shutdown_signal: Mutex::new(Shutdown::new()),
         }
     }
 
@@ -118,7 +119,7 @@ impl MultiGroupXmrigManager {
     /// verify it exists before starting health checks.
     pub fn spawn(
         &mut self,
-        base_path: PathBuf,
+        _base_path: PathBuf,
         log_dir: PathBuf,
         binary_version_path: PathBuf,
         cpu_threads_per_group: u32,
@@ -126,6 +127,17 @@ impl MultiGroupXmrigManager {
         extra_options: Vec<String>,
     ) -> Result<(), anyhow::Error> {
         let xmrig_binary = binary_version_path.clone();
+
+        // Pre-spawn check: verify the binary exists before attempting to spawn.
+        // This provides a clear, actionable error message instead of a generic OS-level failure.
+        if !xmrig_binary.exists() {
+            return Err(anyhow::anyhow!(
+                "Xmrig binary not found at {}. \n\nThis usually means antivirus software has quarantined the file. \nTo fix:\n1. Open your antivirus or Windows Defender security center\n2. Check 'Quarantine' or 'Protection history'\n3. Restore '{}' and add both '{}' and its directory to your antivirus exclusions",
+                xmrig_binary.display(),
+                "xmrig.exe",
+                "xmrig.exe"
+            ));
+        }
 
         for (group_idx, instance) in self.instances.iter_mut().enumerate() {
             // Build xmrig arguments
@@ -158,7 +170,8 @@ impl MultiGroupXmrigManager {
 
             // Build process-wrapper command:
             //   process-wrapper --group <idx> <parent_pid> <xmrig_binary> [args...]
-            let wrapper_path = crate::binaries::BinaryResolver::get_process_wrapper_path()?;
+            let wrapper_path = crate::process_wrapper::get_wrapper_path()
+                .ok_or_else(|| anyhow::anyhow!("Process wrapper not initialized"))?;
             let parent_pid = std::process::id();
 
             let mut cmd_args: Vec<String> = vec![
@@ -171,7 +184,7 @@ impl MultiGroupXmrigManager {
 
             info!(target: LOG_TARGET_APP_LOGIC, "Spawning xmrig on group {} (port {}) with args: {:?}", group_idx, instance.http_port, cmd_args);
 
-            let mut child = std::process::Command::new(wrapper_path)
+            let child = std::process::Command::new(wrapper_path)
                 .args(&cmd_args)
                 .spawn()
                 .map_err(|e| {
@@ -180,49 +193,6 @@ impl MultiGroupXmrigManager {
 
             let wrapper_pid = child.id();
             info!(target: LOG_TARGET_APP_LOGIC, "xmrig spawned on group {} with PID {}", group_idx, wrapper_pid);
-
-            // Store the raw handle for shutdown — capture PID directly to avoid
-            // dangling reference after spawn() returns and `child` goes out of scope.
-            let pid_for_shutdown = child.id();
-            instance.shutdown.register(move || {
-                unsafe {
-                    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-                    use windows_sys::Win32::System::Threading::{
-                        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-                        TerminateProcess,
-                    };
-
-                    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid_for_shutdown);
-                    if !handle.is_null() {
-                        // Try graceful termination via taskkill (tree kill) first
-                        let _ = std::process::Command::new("taskkill")
-                            .args(["/F", "/T", "/PID", &pid_for_shutdown.to_string()])
-                            .output();
-
-                        // Wait briefly for graceful shutdown
-                        let start = std::time::Instant::now();
-                        while start.elapsed() < Duration::from_secs(3) {
-                            let mut exit_code: u32 = 0;
-                            if GetExitCodeProcess(handle, &mut exit_code) != 0
-                                && exit_code != STILL_ACTIVE as u32
-                            {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(100));
-                        }
-
-                        // Force terminate if still running
-                        let mut exit_code: u32 = 0;
-                        if GetExitCodeProcess(handle, &mut exit_code) != 0
-                            && exit_code == STILL_ACTIVE as u32
-                        {
-                            TerminateProcess(handle, 1);
-                        }
-
-                        CloseHandle(handle);
-                    }
-                }
-            });
 
             // Store PID for active termination in stop() and is_running()
             #[cfg(windows)]
@@ -263,7 +233,7 @@ impl MultiGroupXmrigManager {
 
         let aggregated = CpuMinerStatus {
             is_mining,
-            estimated_earnings: 0.0,
+            estimated_earnings: 0,
             hash_rate: total_hash_rate,
             connection: crate::mining::cpu::CpuMinerConnectionStatus {
                 is_connected,
@@ -272,6 +242,41 @@ impl MultiGroupXmrigManager {
 
         let _ = self.summary_broadcast.send(aggregated.clone());
         aggregated
+    }
+
+    /// Aggregate status from port/token pairs without needing &self.
+    /// Used by callers who extract ports while holding a lock guard, then drop it before awaiting
+    /// to avoid non-Send guards across await points in Tauri command handlers.
+    pub async fn aggregate_from_ports(ports: &[(u16, String)]) -> CpuMinerStatus {
+        let mut total_hash_rate: f64 = 0.0;
+        let mut is_mining = false;
+        let mut is_connected = false;
+
+        for (group_idx, (http_port, http_token)) in ports.iter().enumerate() {
+            match Self::fetch_status(*http_port, http_token).await {
+                Ok(status) => {
+                    total_hash_rate += status.hash_rate;
+                    if status.is_mining {
+                        is_mining = true;
+                    }
+                    if status.connection.is_connected {
+                        is_connected = true;
+                    }
+                }
+                Err(e) => {
+                    warn!(target: LOG_TARGET_APP_LOGIC, "Failed to fetch status from group {}: {}", group_idx, e);
+                }
+            }
+        }
+
+        CpuMinerStatus {
+            is_mining,
+            estimated_earnings: 0,
+            hash_rate: total_hash_rate,
+            connection: crate::mining::cpu::CpuMinerConnectionStatus {
+                is_connected,
+            },
+        }
     }
 
     /// Poll a single xmrig instance's HTTP API.
@@ -310,7 +315,7 @@ impl MultiGroupXmrigManager {
 
         Ok(CpuMinerStatus {
             is_mining: true,
-            estimated_earnings: 0.0,
+            estimated_earnings: 0,
             hash_rate: avg_hash_rate,
             connection: crate::mining::cpu::CpuMinerConnectionStatus {
                 is_connected: body.connection.uptime > 0,
@@ -323,59 +328,78 @@ impl MultiGroupXmrigManager {
         info!(target: LOG_TARGET_APP_LOGIC, "Stopping multi-group xmrig ({} groups)", self.instances.len());
 
         // Signal the status aggregation loop to stop polling
-        self.shutdown_signal.trigger();
+        if let Ok(mut signal) = self.shutdown_signal.lock() {
+            signal.trigger();
+            *signal = Shutdown::new();
+        }
+
+        // Extract PIDs before dropping any borrow of self — this avoids holding
+        // a non-Send RwLockWriteGuard across an await point in callers.
+        let pids: Vec<u32> = self.instances.iter()
+            .filter_map(|inst| inst.wrapper_pid)
+            .collect();
+
+        Self::terminate_all(&pids).await;
+
+        Ok(())
+    }
+
+    /// Terminate all wrapper processes by PID without needing &self.
+    /// Used by callers who extract PIDs from the manager before releasing a lock guard,
+    /// avoiding non-Send guards across await points in Tauri command handlers.
+    pub async fn terminate_all(pids: &[u32]) {
+        if pids.is_empty() { return; }
+
+        info!(target: LOG_TARGET_APP_LOGIC, "Terminating {} wrapper processes", pids.len());
 
         #[cfg(windows)]
         {
             use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
             use windows_sys::Win32::System::Threading::{
-                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-                TerminateProcess,
+                GetExitCodeProcess, OpenProcess, TerminateProcess,
             };
 
-            for (group_idx, instance) in self.instances.iter().enumerate() {
-                if let Some(wrapper_pid) = instance.wrapper_pid {
-                    info!(target: LOG_TARGET_APP_LOGIC, "Terminating group {} wrapper PID {}", group_idx, wrapper_pid);
+            for (group_idx, &wrapper_pid) in pids.iter().enumerate() {
+                info!(target: LOG_TARGET_APP_LOGIC, "Terminating group {} wrapper PID {}", group_idx, wrapper_pid);
 
-                    unsafe {
-                        // Open the process with terminate access
-                        const SYNCHRONIZE: u32 = 0x0010_0000;
-                        const STANDARD_RIGHTS_REQUIRED: u32 = 0x000F_0000;
-                        let desired_access = STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0xFFFF;
-                        let handle = OpenProcess(desired_access, 0, wrapper_pid);
+                unsafe {
+                    // Open the process with terminate access
+                    const SYNCHRONIZE: u32 = 0x0010_0000;
+                    const STANDARD_RIGHTS_REQUIRED: u32 = 0x000F_0000;
+                    let desired_access = STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0xFFFF;
+                    let handle = OpenProcess(desired_access, 0, wrapper_pid);
 
-                        if !handle.is_null() {
-                            // First try graceful termination via taskkill (tree kill)
-                            let _ = std::process::Command::new("taskkill")
-                                .args(["/F", "/T", "/PID", &wrapper_pid.to_string()])
-                                .output();
+                    if handle != 0 {
+                        // First try graceful termination via taskkill (tree kill)
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/F", "/T", "/PID", &wrapper_pid.to_string()])
+                            .output();
 
-                            // Wait briefly for graceful shutdown
-                            let start = std::time::Instant::now();
-                            while start.elapsed() < Duration::from_secs(5) {
-                                let mut exit_code: u32 = 0;
-                                if GetExitCodeProcess(handle, &mut exit_code) != 0
-                                    && exit_code != STILL_ACTIVE as u32
-                                {
-                                    info!(target: LOG_TARGET_APP_LOGIC, "Group {} wrapper exited gracefully", group_idx);
-                                    break;
-                                }
-                                std::thread::sleep(Duration::from_millis(200));
-                            }
-
-                            // Force terminate if still running
+                        // Wait briefly for graceful shutdown
+                        let start = std::time::Instant::now();
+                        while start.elapsed() < Duration::from_secs(5) {
                             let mut exit_code: u32 = 0;
                             if GetExitCodeProcess(handle, &mut exit_code) != 0
-                                && exit_code == STILL_ACTIVE as u32
+                                && exit_code != STILL_ACTIVE as u32
                             {
-                                info!(target: LOG_TARGET_APP_LOGIC, "Force-terminating group {} wrapper PID {}", group_idx, wrapper_pid);
-                                TerminateProcess(handle, 1);
+                                info!(target: LOG_TARGET_APP_LOGIC, "Group {} wrapper exited gracefully", group_idx);
+                                break;
                             }
-
-                            CloseHandle(handle);
-                        } else {
-                            warn!(target: LOG_TARGET_APP_LOGIC, "Failed to open handle for group {} wrapper PID {}: error={}", group_idx, wrapper_pid, std::io::Error::last_os_error());
+                            std::thread::sleep(Duration::from_millis(200));
                         }
+
+                        // Force terminate if still running
+                        let mut exit_code: u32 = 0;
+                        if GetExitCodeProcess(handle, &mut exit_code) != 0
+                            && exit_code == STILL_ACTIVE as u32
+                        {
+                            info!(target: LOG_TARGET_APP_LOGIC, "Force-terminating group {} wrapper PID {}", group_idx, wrapper_pid);
+                            TerminateProcess(handle, 1);
+                        }
+
+                        CloseHandle(handle);
+                    } else {
+                        warn!(target: LOG_TARGET_APP_LOGIC, "Failed to open handle for group {} wrapper PID {}: error={}", group_idx, wrapper_pid, std::io::Error::last_os_error());
                     }
                 }
             }
@@ -389,11 +413,22 @@ impl MultiGroupXmrigManager {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
-
-        Ok(())
     }
 
     pub fn is_running(&self) -> bool {
-        !self.instances.is_empty() && !self.shutdown_signal.is_triggered()
+        !self.instances.is_empty() && !self.shutdown_signal.lock().unwrap().is_triggered()
+    }
+
+    /// Extract wrapper PIDs from all instances. Used by callers who need to terminate processes
+    /// without holding a non-Send lock guard across await points.
+    #[cfg(windows)]
+    pub fn get_pids(&self) -> Vec<u32> {
+        self.instances.iter().filter_map(|i| i.wrapper_pid).collect()
+    }
+
+    /// Extract (http_port, http_token) pairs from all instances for status aggregation
+    /// without needing &mut access to the manager.
+    pub fn get_ports(&self) -> Vec<(u16, String)> {
+        self.instances.iter().map(|i| (i.http_port, i.http_token.clone())).collect()
     }
 }

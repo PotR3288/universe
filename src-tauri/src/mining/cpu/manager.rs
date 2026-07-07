@@ -20,7 +20,8 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::sync::LazyLock;
+use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 
 use log::{error, info};
 use tari_shutdown::Shutdown;
@@ -58,13 +59,13 @@ use crate::{
 };
 
 #[cfg(windows)]
-use crate::mining::cpu::multi_group_manager::{MultiGroupXmrigManager, get_group_processor_count};
+use crate::mining::cpu::multi_group_manager::MultiGroupXmrigManager;
 
 static INSTANCE: LazyLock<RwLock<CpuManager>> = LazyLock::new(|| RwLock::new(CpuManager::new()));
 
 /// Shared shutdown signal for the multi-group status aggregation loop (Windows >64 threads).
 #[cfg(windows)]
-static MULTI_GROUP_SHUTDOWN: LazyLock<Shutdown> = LazyLock::new(|| Shutdown::new());
+static MULTI_GROUP_SHUTDOWN: LazyLock<Mutex<Shutdown>> = LazyLock::new(|| Mutex::new(Shutdown::new()));
 
 pub struct CpuManager {
     app_handle: Option<AppHandle>,
@@ -102,17 +103,12 @@ impl CpuManager {
         process_watcher.expected_startup_time = std::time::Duration::from_secs(30);
         Self {
             app_handle: None,
-            // ======= Process watcher =======
-<<<<<<< HEAD
-            process_watcher,
-=======
             process_watcher: ProcessWatcher::new(
                 XmrigAdapter::new(Sender::new(CpuMinerStatus::default())),
                 Sender::new(ProcessWatcherStats::default()),
             ),
             #[cfg(windows)]
             multi_group_manager: std::sync::RwLock::new(None),
->>>>>>> c321f6f3 (xmrig instance per processor group)
             // ======= Parameters tracking =======
             status_thread_shutdown: Shutdown::new(),
             process_stats_collector: Sender::new(ProcessWatcherStats::default()),
@@ -280,7 +276,7 @@ impl CpuManager {
                 let total_threads = available_threads::available_parallelism();
                 if total_threads > 64 {
                     info!(target: LOG_TARGET_APP_LOGIC, "Detected {} threads — using multi-group mining", total_threads);
-                    return Self::start_mining_multi_group(
+                    return self.start_mining_multi_group(
                         base_path,
                         log_path,
                         global_shutdown_signal,
@@ -291,6 +287,21 @@ impl CpuManager {
             }
 
             // ─── Single-process path (non-Windows or ≤64 threads) ─────────
+
+            // Pre-flight check: verify the xmrig binary exists before attempting to start.
+            // This catches antivirus quarantine / deletion early with a clear, actionable error.
+            let xmrig_path = crate::binaries::BinaryResolver::current()
+                .get_binary_path(binary)
+                .await?;
+            if !xmrig_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "Xmrig binary not found at {}. \n\nThis usually means antivirus software has quarantined the file. \nTo fix:\n1. Open your antivirus or Windows Defender security center\n2. Check 'Quarantine' or 'Protection history'\n3. Restore '{}' and add both '{}' and its directory to your antivirus exclusions",
+                    xmrig_path.display(),
+                    "xmrig.exe",
+                    "xmrig.exe"
+                ));
+            }
+
             self.process_watcher
                 .start(
                     base_path,
@@ -315,9 +326,11 @@ impl CpuManager {
     pub fn is_running(&self) -> bool {
         #[cfg(windows)]
         {
-            if let Ok(Some(mgr)) = self.multi_group_manager.try_read() {
-                if mgr.is_running() {
-                    return true;
+            if let Ok(guard) = self.multi_group_manager.try_read() {
+                if let Some(ref mgr) = *guard {
+                    if mgr.is_running() {
+                        return true;
+                    }
                 }
             }
         }
@@ -327,6 +340,7 @@ impl CpuManager {
     /// Start mining using one xmrig process per processor group (Windows >64 threads).
     #[cfg(windows)]
     async fn start_mining_multi_group(
+        &mut self,
         base_path: PathBuf,
         log_path: PathBuf,
         global_shutdown_signal: tari_shutdown::ShutdownSignal,
@@ -338,8 +352,10 @@ impl CpuManager {
         let binary = crate::binaries::Binaries::Xmrig;
         let xmrig_path = BinaryResolver::current().get_binary_path(binary).await?;
 
-        // Build connection-type args shared by all groups from the adapter
-        let adapter = Self::read().await.process_watcher.adapter.clone();
+        // Build connection-type args shared by all groups from the adapter.
+        // We already hold &mut self (and thus a write lock on INSTANCE), so we
+        // read directly — no Self::read()/write() calls that would deadlock.
+        let adapter = self.process_watcher.adapter.clone();
         let connection_type_args: Vec<String> = match &adapter.connection_type {
             CpuConnectionType::LocalMMProxy { local_proxy_url } => vec![
                 "--user".to_string(),
@@ -364,7 +380,7 @@ impl CpuManager {
 
         // Determine threads per group: total_threads / num_groups, rounded up
         let total_threads = available_threads::available_parallelism();
-        let num_groups = multi_group_manager::num_groups() as usize;
+        let num_groups = super::multi_group_manager::num_groups() as usize;
         if num_groups == 0 {
             return Err(anyhow::anyhow!("No processor groups detected"));
         }
@@ -389,10 +405,11 @@ impl CpuManager {
             extra_options,
         )?;
 
-        // Store the manager so stop_mining can shut it down
+        // Store the manager so stop_mining can shut it down.
+        // We already hold &mut self — no need to re-acquire a lock on INSTANCE.
         {
-            let mut guard = Self::write().await.multi_group_manager.write().await;
-            *guard = Some(mgr);
+            let mut mgr_guard = self.multi_group_manager.write().unwrap();
+            *mgr_guard = Some(mgr);
         }
 
         // Start status aggregation loop
@@ -414,7 +431,8 @@ impl CpuManager {
     ) {
         use std::time::Duration;
 
-        let mut inner_shutdown = MULTI_GROUP_SHUTDOWN.to_signal();
+        let mut inner_shutdown = MULTI_GROUP_SHUTDOWN.lock().unwrap().to_signal();
+        let mut global_shutdown_clone = global_shutdown_signal.clone();
 
         task_tracker.spawn(async move {
             loop {
@@ -423,15 +441,22 @@ impl CpuManager {
                         info!(target: LOG_TARGET_STATUSES, "Shutting down multi-group status aggregation");
                         break;
                     }
-                    _ = global_shutdown_signal.clone().wait() => {
+                    _ = global_shutdown_clone.wait() => {
                         info!(target: LOG_TARGET_STATUSES, "Global shutdown — stopping multi-group status aggregation");
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                        // Aggregate and broadcast
-                        if let Ok(Some(mgr)) = crate::mining::cpu::manager::CpuManager::read().await.multi_group_manager.try_read() {
-                            let _ = mgr.aggregate_status().await;
-                        }
+                        // Extract port/token pairs while holding the lock, then drop it before awaiting.
+                        let ports: Vec<(u16, String)> = {
+                            if let Ok(guard) = crate::mining::cpu::manager::CpuManager::read().await.multi_group_manager.try_read() {
+                                guard.as_ref().map_or(Vec::new(), |mgr| mgr.get_ports())
+                            } else {
+                                Vec::new()
+                            }
+                        };
+
+                        // Drop the lock — now safe to await without holding a non-Send guard
+                        let _ = MultiGroupXmrigManager::aggregate_from_ports(&ports).await;
                     }
                 }
             }
@@ -462,12 +487,26 @@ impl CpuManager {
         // ─── Stop multi-group manager (Windows >64 threads) ──────────
         #[cfg(windows)]
         {
-            if let Ok(Some(ref mut mgr)) = self.multi_group_manager.try_write() {
-                info!(target: LOG_TARGET_APP_LOGIC, "Stopping multi-group miner");
-                let _ = mgr.stop().await;
-                *mgr = MultiGroupXmrigManager::new(Sender::new(CpuMinerStatus::default()));
+            // Extract PIDs while holding the read guard, then drop it before awaiting.
+            let pids: Vec<u32> = {
+                if let Ok(guard) = self.multi_group_manager.try_read() {
+                    guard.as_ref().map_or(Vec::new(), |mgr| mgr.get_pids())
+                } else {
+                    Vec::new()
+                }
+            };
+
+            // Drop the read lock — now safe to await without holding a non-Send guard
+            if let Ok(mut shutdown) = MULTI_GROUP_SHUTDOWN.lock() {
+                shutdown.trigger();
+                *shutdown = Shutdown::new();
             }
-            MULTI_GROUP_SHUTDOWN.trigger();
+            MultiGroupXmrigManager::terminate_all(&pids).await;
+
+            // Replace with a fresh manager (no guard held across await above)
+            if let Ok(mut guard) = self.multi_group_manager.try_write() {
+                *guard = Some(MultiGroupXmrigManager::new(Sender::new(CpuMinerStatus::default())));
+            }
         }
 
         // ─── Stop single-process miner ────────────────────────────────
@@ -494,9 +533,22 @@ impl CpuManager {
     pub async fn on_app_exit(&self) {
         // ─── Clean up multi-group processes (Windows >64 threads) ─────
         #[cfg(windows)]
-        if let Ok(Some(ref mgr)) = self.multi_group_manager.try_read() {
-            MULTI_GROUP_SHUTDOWN.trigger();
-            let _ = mgr.stop().await;
+        {
+            // Extract PIDs while holding the read guard, then drop it before awaiting.
+            let pids: Vec<u32> = {
+                if let Ok(guard) = self.multi_group_manager.try_read() {
+                    guard.as_ref().map_or(Vec::new(), |mgr| mgr.get_pids())
+                } else {
+                    Vec::new()
+                }
+            };
+
+            // Drop the read lock — now safe to await without holding a non-Send guard
+            if let Ok(mut shutdown) = MULTI_GROUP_SHUTDOWN.lock() {
+                shutdown.trigger();
+                *shutdown = Shutdown::new();
+            }
+            MultiGroupXmrigManager::terminate_all(&pids).await;
         }
 
         // ─── Clean up single-process miner ────────────────────────────

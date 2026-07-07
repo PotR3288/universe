@@ -6732,6 +6732,7 @@ dependencies = [
 name = "process-wrapper"
 version = "1.6.11"
 dependencies = [
+ "cc",
  "libc",
  "windows-sys 0.59.0",
 ]

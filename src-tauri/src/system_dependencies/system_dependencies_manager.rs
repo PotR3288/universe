@@ -23,6 +23,8 @@
 use std::sync::LazyLock;
 
 use anyhow::Error;
+#[cfg(target_os = "windows")]
+use anyhow::anyhow;
 
 #[cfg(target_os = "windows")]
 use crate::events_emitter::EventsEmitter;
@@ -31,6 +33,8 @@ use crate::system_dependencies::UniversalDependencyStatus;
 use crate::system_dependencies::UniversalSystemDependency;
 #[cfg(target_os = "windows")]
 use crate::system_dependencies::windows::resolver::WindowsDependenciesResolver;
+#[cfg(target_os = "windows")]
+use crate::tasks_tracker::TasksTrackers;
 
 static INSTANCE: LazyLock<SystemDependenciesManager> =
     LazyLock::new(SystemDependenciesManager::new);

@@ -4,3 +4,6 @@ resolver = "2"
 
 [profile.release]
 debug = true
+
+[patch.crates-io]
+liblmdb-sys = { path = "patches/liblmdb-sys" }

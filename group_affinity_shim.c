@@ -14,6 +14,24 @@ int shim_set_process_group_affinity(HANDLE hProcess, USHORT groupCount, GROUP_AF
         fn = (PFN_SetProcessGroupAffinity)GetProcAddress(
             GetModuleHandleA("kernel32.dll"), "SetProcessGroupAffinity");
     }
-    if (!fn) return 0;
+    if (!fn) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return 0;
+    }
     return fn(hProcess, groupCount, affinity);
+}
+
+int shim_get_process_group_affinity(HANDLE hProcess, GROUP_AFFINITY* affinity) {
+    typedef BOOL (WINAPI *PFN_GetProcessGroupAffinity)(HANDLE, PGROUP_AFFINITY, PUSHORT);
+    static PFN_GetProcessGroupAffinity fn = NULL;
+    if (!fn) {
+        fn = (PFN_GetProcessGroupAffinity)GetProcAddress(
+            GetModuleHandleA("kernel32.dll"), "GetProcessGroupAffinity");
+    }
+    USHORT numGroups = 0;
+    if (!fn) {
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return 0;
+    }
+    return fn(hProcess, affinity, &numGroups);
 }

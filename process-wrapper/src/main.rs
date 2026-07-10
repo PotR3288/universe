@@ -44,6 +44,8 @@ use std::thread;
 use std::time::Duration;
 
 const POLL_INTERVAL_MS: u64 = 200;
+
+#[cfg(unix)]
 const GRACEFUL_SHUTDOWN_SECS: u64 = 10;
 
 static SHOULD_TERMINATE: AtomicBool = AtomicBool::new(false);
@@ -89,13 +91,16 @@ fn main() {
     let binary = &remaining_args[1];
     let binary_args = &remaining_args[2..];
 
-    // On Windows, bind to the specified processor group before spawning child
+    // On Windows, bind to the specified processor group before spawning child.
+    // Returns true if thread-level affinity was set (used for CREATE_FROZEN decision).
     #[cfg(windows)]
-    if let Some(group) = group_index {
-        apply_group_affinity(group);
-    }
+    let affinity_set = if let Some(group) = group_index {
+        apply_group_affinity(group)
+    } else {
+        false
+    };
 
-    let mut child = match spawn_child(binary, binary_args) {
+    let mut child = match spawn_child(binary, binary_args, #[cfg(windows)] affinity_set) {
         Ok(child) => child,
         Err(e) => {
             eprintln!("Failed to spawn child process: {}", e);
@@ -139,51 +144,198 @@ fn main() {
     }
 }
 
-/// Apply processor group affinity on Windows.
+/// Process-group affinity shim for Windows.
 ///
-/// Binds the current process (and thus its children) to a specific processor group.
-/// This is essential on systems with >64 logical processors where each group has
-/// at most 64 CPUs. Without this, xmrig's huge page allocator fails for threads
-/// outside the default affinity mask.
+/// Resolves `SetProcessGroupAffinity` / `GetProcessGroupAffinity` dynamically via
+/// `GetProcAddress` to avoid linker errors on SDKs that omit the import stub.
+/// Falls back to thread-level `SetThreadGroupAffinity` when process-level APIs are unavailable.
 #[cfg(windows)]
-fn apply_group_affinity(group: u16) {
-    // The C shim (compiled by build.rs) calls SetProcessGroupAffinity from
-    // kernel32.dll.  This is needed because windows-sys v0.52 doesn't expose
-    // the symbol, and raw FFI alone won't link without the import library.
+mod affinity_shim {
+    use std::ffi::{CStr, OsStr};
+    use std::os::windows::prelude::OsStrExt;
 
     #[repr(C)]
-    struct GroupAffinity {
-        group: u16,
-        reserved: [u32; 3],
-        mask: u64,
+    pub struct GroupAffinity {
+        pub mask: u64,
+        pub group: u16,
+        pub reserved: [u16; 3],
     }
 
-    extern "C" {
-        fn shim_set_process_group_affinity(
-            hprocess: *mut std::ffi::c_void,
-            groupcount: u16,
-            affinity: *const GroupAffinity,
-        ) -> i32;
+    type SetProcessGroupAffinityFn = unsafe extern "system" fn(
+        hprocess: *mut std::ffi::c_void,
+        groupcount: u16,
+        affinity: *mut GroupAffinity,
+    ) -> i32;
+
+    type GetProcessGroupAffinityFn = unsafe extern "system" fn(
+        hprocess: *mut std::ffi::c_void,
+        affinity: *mut GroupAffinity,
+        num_groups: *mut u16,
+    ) -> i32;
+
+    /// Returns a handle to kernel32.dll (always loaded in every Windows process).
+    fn get_kernel32() -> *mut std::ffi::c_void {
+        let name: Vec<u16> = OsStr::new("kernel32.dll").encode_wide().collect();
+        unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(name.as_ptr()) }
     }
 
+    /// Resolve the SetProcessGroupAffinity function pointer, or null if unavailable.
+    fn resolve_set_fn() -> Option<SetProcessGroupAffinityFn> {
+        let h = get_kernel32();
+        if h.is_null() {
+            return None;
+        }
+        let name = CStr::from_bytes_with_nul(b"SetProcessGroupAffinity\0").unwrap();
+        // Safety: GetProcAddress is safe to call; we check the result.
+        // FARPROC in windows-sys 0.59 is Option<fn() -> isize>, so null => None.
+        let ptr = unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+                h,
+                name.as_ptr() as *const i8 as *const u8,
+            )
+        };
+        if ptr.is_none() {
+            return None;
+        }
+        // Safety: SetProcessGroupAffinity has the expected signature on all Windows versions.
+        Some(unsafe { std::mem::transmute(ptr.unwrap()) })
+    }
+
+    /// Resolve the GetProcessGroupAffinity function pointer, or null if unavailable.
+    fn resolve_get_fn() -> Option<GetProcessGroupAffinityFn> {
+        let h = get_kernel32();
+        if h.is_null() {
+            return None;
+        }
+        let name = CStr::from_bytes_with_nul(b"GetProcessGroupAffinity\0").unwrap();
+        // Safety: GetProcAddress is safe to call; we check the result.
+        // FARPROC in windows-sys 0.59 is Option<fn() -> isize>, so null => None.
+        let ptr = unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+                h,
+                name.as_ptr() as *const i8 as *const u8,
+            )
+        };
+        if ptr.is_none() {
+            return None;
+        }
+        // Safety: GetProcessGroupAffinity has the expected signature on all Windows versions.
+        Some(unsafe { std::mem::transmute(ptr.unwrap()) })
+    }
+
+    /// Set process-level processor group affinity, falling back to thread-level if needed.
+    pub fn set_process(_group: u16, affinity: &mut GroupAffinity) -> bool {
+        let h = get_kernel32();
+        if h.is_null() {
+            return false;
+        }
+
+        // Try process-level first (lazy-resolve once).
+        let set_fn = resolve_set_fn();
+        if let Some(set_fn) = set_fn {
+            unsafe {
+                let result = set_fn(h, 1, affinity);
+                if result != 0 {
+                    return true;
+                }
+            }
+        }
+
+        // Fall back to thread-level SetThreadGroupAffinity.
+        eprintln!(
+            "[affinity_shim] SetProcessGroupAffinity unavailable — falling back to thread-level"
+        );
+        let name = CStr::from_bytes_with_nul(b"SetThreadGroupAffinity\0").unwrap();
+        // Safety: GetProcAddress is safe to call; we check the result.
+        // FARPROC in windows-sys 0.59 is Option<fn() -> isize>, so null => None.
+        let ptr = unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+                h,
+                name.as_ptr() as *const i8 as *const u8,
+            )
+        };
+        if ptr.is_some() {
+            type SetThreadFn = unsafe extern "system" fn(
+                hthread: *mut std::ffi::c_void,
+                affinity: *mut GroupAffinity,
+                previous_affinity: *mut GroupAffinity,
+            ) -> i32;
+            // Safety: SetThreadGroupAffinity has the expected signature.
+            let set_thread: SetThreadFn = unsafe { std::mem::transmute(ptr.unwrap()) };
+            let current_thread =
+                unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() };
+            let mut previous = GroupAffinity { mask: 0, group: 0, reserved: [0; 3] };
+            let result = unsafe { set_thread(current_thread, affinity, &mut previous) };
+            if result != 0 {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Get process-level processor group affinity.
+    pub fn get_process(h: *mut std::ffi::c_void, affinity: &mut GroupAffinity) -> bool {
+        let Some(get_fn) = resolve_get_fn() else {
+            return false;
+        };
+
+        // Safety: GetProcessGroupAffinity has the expected signature.
+        unsafe { get_fn(h, affinity, std::ptr::null_mut()) != 0 }
+    }
+}
+
+/// Apply processor group affinity on Windows.
+///
+/// Tries `SetProcessGroupAffinity` first (process-level). If that API is unavailable,
+/// falls back to `SetThreadGroupAffinity` applied to the current thread.
+/// Returns true if any form of affinity was successfully set — this signals that
+/// child processes should be spawned with CREATE_FROZEN so their primary thread
+/// inherits our thread-level affinity before executing.
+#[cfg(windows)]
+fn apply_group_affinity(group: u16) -> bool {
     unsafe {
         let process_handle = windows_sys::Win32::System::Threading::GetCurrentProcess();
 
-        let affinity = GroupAffinity {
-            group,
-            reserved: [0; 3],
-            mask: 0,
-        };
-
-        if shim_set_process_group_affinity(process_handle, 1, &affinity) != 0 {
+        // Query current group to verify the shim works at all
+        let mut current = affinity_shim::GroupAffinity { mask: 0, group: 0, reserved: [0; 3] };
+        if affinity_shim::get_process(process_handle, &mut current) {
             eprintln!(
-                "[process-wrapper] Applied processor group affinity: group={group}",
+                "[process-wrapper] Current affinity before set: group={}, mask=0x{:016X}",
+                current.group, current.mask
             );
         } else {
             let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(122) {
+                eprintln!(
+                    "[process-wrapper] WARNING: GetProcessGroupAffinity failed with error 122 (buffer too small). \
+                     Processor group affinity will not be set.",
+                );
+            } else {
+                eprintln!(
+                    "[process-wrapper] GetProcessGroupAffinity unavailable: {}", err
+                );
+            }
+        }
+
+        let mut affinity = affinity_shim::GroupAffinity {
+            mask: 0,
+            group,
+            reserved: [0; 3],
+        };
+
+        if affinity_shim::set_process(group, &mut affinity) {
             eprintln!(
-                "[process-wrapper] Failed to apply processor group affinity: group={group}, error={err}",
+                "[process-wrapper] Applied processor group affinity: group={group}",
             );
+            return true; // Process-level or thread-level affinity set.
+        } else {
+            let err = std::io::Error::last_os_error();
+            eprintln!(
+                "[process-wrapper] Failed to apply processor group affinity: group={}, error={} (code {})",
+                group, err, err.raw_os_error().unwrap_or(-1)
+            );
+            return false; // Neither process-level nor thread-level fallback succeeded.
         }
 
         // NOTE: process_handle is a pseudo-handle from GetCurrentProcess() — do NOT close it.
@@ -206,18 +358,30 @@ fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
 }
 
 #[cfg(windows)]
-fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
+fn spawn_child(binary: &str, args: &[String], affinity_set: bool) -> Result<Child, std::io::Error> {
     use std::os::windows::process::CommandExt;
 
     // CREATE_NO_WINDOW: suppress console window for the child process.
     // CREATE_BREAKAWAY_FROM_JOB: allow the process to break away from any job object
     //    the parent is in, preventing the scheduler from throttling it.
+    // CREATE_FROZEN (0x10): create the process in a frozen state so the primary thread
+    //    inherits our thread-level affinity before executing. This is essential when
+    //    SetProcessGroupAffinity is unavailable — we set affinity on our own thread first,
+    //    then spawn with CREATE_FROZEN so the child's main thread starts with that affinity.
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+    const CREATE_FROZEN: u32 = 0x00000010;
+
+    let mut flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+
+    // Use CREATE_FROZEN when we've set thread-level affinity (fallback for systems without SetProcessGroupAffinity)
+    if affinity_set {
+        flags |= CREATE_FROZEN;
+    }
 
     Command::new(binary)
         .args(args)
-        .creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
+        .creation_flags(flags)
         .spawn()
 }
 

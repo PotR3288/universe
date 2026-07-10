@@ -4505,8 +4505,6 @@ dependencies = [
 [[package]]
 name = "liblmdb-sys"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "feed38a3a580f60bf61aaa067b0ff4123395966839adeaf67258a9e50c4d2e49"
 dependencies = [
  "gcc",
  "libc",
@@ -6732,7 +6730,6 @@ dependencies = [
 name = "process-wrapper"
 version = "1.6.11"
 dependencies = [
- "cc",
  "libc",
  "windows-sys 0.59.0",
 ]
@@ -9069,7 +9066,7 @@ dependencies = [
 
 [[package]]
 name = "tari-universe"
-version = "1.6.11"
+version = "1.6.12"
 dependencies = [
  "anyhow",
  "async-trait",

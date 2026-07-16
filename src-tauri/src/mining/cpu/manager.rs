@@ -439,10 +439,14 @@ impl CpuManager {
                 tokio::select! {
                     _ = inner_shutdown.wait() => {
                         info!(target: LOG_TARGET_STATUSES, "Shutting down multi-group status aggregation");
+                        EventsEmitter::emit_cpu_mining_update(CpuMinerStatus::default()).await;
+                        SystemTrayManager::send_event(SystemTrayEvents::CpuHashrate(0.0)).await;
                         break;
                     }
                     _ = global_shutdown_clone.wait() => {
                         info!(target: LOG_TARGET_STATUSES, "Global shutdown — stopping multi-group status aggregation");
+                        EventsEmitter::emit_cpu_mining_update(CpuMinerStatus::default()).await;
+                        SystemTrayManager::send_event(SystemTrayEvents::CpuHashrate(0.0)).await;
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {
@@ -456,7 +460,11 @@ impl CpuManager {
                         };
 
                         // Drop the lock — now safe to await without holding a non-Send guard
-                        let _ = MultiGroupXmrigManager::aggregate_from_ports(&ports).await;
+                        let aggregated_status = MultiGroupXmrigManager::aggregate_from_ports(&ports).await;
+
+                        // Broadcast the aggregated status to the frontend and system tray.
+                        EventsEmitter::emit_cpu_mining_update(aggregated_status.clone()).await;
+                        SystemTrayManager::send_event(SystemTrayEvents::CpuHashrate(aggregated_status.hash_rate)).await;
                     }
                 }
             }

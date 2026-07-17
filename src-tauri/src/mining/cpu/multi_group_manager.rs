@@ -379,6 +379,10 @@ impl MultiGroupXmrigManager {
                         // First try graceful termination via taskkill (tree kill)
                         let _ = std::process::Command::new("taskkill")
                             .args(["/F", "/T", "/PID", &wrapper_pid.to_string()])
+                            .creation_flags({
+                                use crate::consts::PROCESS_CREATION_NO_WINDOW;
+                                PROCESS_CREATION_NO_WINDOW
+                            })
                             .output();
 
                         // Wait briefly for graceful shutdown

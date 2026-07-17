@@ -29,6 +29,8 @@
 //! single CpuMinerStatus broadcast.
 
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -186,6 +188,10 @@ impl MultiGroupXmrigManager {
 
             let child = std::process::Command::new(wrapper_path)
                 .args(&cmd_args)
+                .creation_flags({
+                    use crate::consts::PROCESS_CREATION_NO_WINDOW;
+                    PROCESS_CREATION_NO_WINDOW
+                })
                 .spawn()
                 .map_err(|e| {
                     anyhow::anyhow!("Failed to spawn xmrig on group {}: {}", group_idx, e)

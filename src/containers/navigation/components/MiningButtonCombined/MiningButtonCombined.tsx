@@ -24,10 +24,19 @@ export default function MiningButtonCombined() {
     const isCPUMining = useMiningMetricsStore((s) => s.cpu_mining_status.is_mining);
     const isGPUMining = useMiningMetricsStore((s) => s.gpu_mining_status.is_mining);
     const isMining = isCPUMining || isGPUMining;
+    const cpuHashRate = useMiningMetricsStore((s) => s.cpu_mining_status.hash_rate);
+    const gpuHashRate = useMiningMetricsStore((s) => s.gpu_mining_status.hash_rate);
+    const combinedHashRate = cpuHashRate + gpuHashRate;
     const isCpuMiningEnabled = useConfigMiningStore((s) => s.cpu_mining_enabled);
     const isGpuMiningEnabled = useConfigMiningStore((s) => s.gpu_mining_enabled);
     const isMiningEnabled = isCpuMiningEnabled || isGpuMiningEnabled;
-    const isMiningLoading = (isMining && !isMiningInitiated) || (isMiningInitiated && !isMining);
+    // Show loading only when both flags indicate mining started but metrics
+    // haven't arrived yet.  When the flags are out of sync in either direction,
+    // treat it as a stable state — not a transient loading phase.  On multi-
+    // instance systems (>64 threads) the backend's status aggregation loop may
+    // stop before emitting a final `is_mining: false` update, leaving stale
+    // metrics that would keep a spinner spinning forever.
+    const isMiningLoading = isMiningInitiated && isMining && combinedHashRate === 0;
     const isMiningUnlocked = gpuMiningModuleInitialized || cpuMiningModuleInitialized;
     const isMiningButtonDisabled =
         isMiningLoading || !isMiningControlsEnabled || !isMiningEnabled || !isMiningUnlocked || changingModes;

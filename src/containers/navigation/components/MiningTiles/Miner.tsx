@@ -54,8 +54,13 @@ export default function MinerTile({
 
     const hasMinerModuleCrashed = minerModuleState.status === AppModuleStatus.Failed;
 
-    const hashrateLoading = enabled && isMining && hashRate <= 0;
-    const isLoading = (isMiningInitiated && !isMining) || (isMining && !isMiningInitiated) || hashrateLoading;
+    // Show loading only when mining just started and metrics haven't arrived yet
+    // (both flags true but hashRate is still zero). When the flags are out of sync
+    // in either direction, treat it as a stable state — not a transient loading
+    // phase.  On multi-instance systems (>64 threads) the backend's status
+    // aggregation loop may stop before emitting a final `is_mining: false` update,
+    // leaving stale metrics that would keep a spinner spinning forever.
+    const isLoading = isMiningInitiated && isMining && hashRate === 0;
 
     const formattedHashRate = formatHashrate(hashRate, true, algo);
     const currentUnpaid = (poolStats?.unpaid || 0) / 1_000_000;

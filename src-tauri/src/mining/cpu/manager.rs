@@ -392,7 +392,11 @@ impl CpuManager {
         let extra_options = if cpu_usage_percentage <= 1 {
             vec!["--randomx-mode=light".to_string()]
         } else {
-            vec!["--randomx-mode=fast".to_string()]
+            vec![
+                "--yield=false".to_string(),
+                "--priority=5".to_string(),
+                "--randomx-mode=fast".to_string(),
+            ]
         };
 
         // Create and spawn the multi-group manager

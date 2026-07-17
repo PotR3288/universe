@@ -378,14 +378,15 @@ impl CpuManager {
             }
         };
 
-        // Determine threads per group: total_threads / num_groups, rounded up
+        // Determine threads per group: scale total by cpu_usage_percentage, then divide across groups.
         let total_threads = available_threads::available_parallelism();
         let num_groups = super::multi_group_manager::num_groups() as usize;
         if num_groups == 0 {
             return Err(anyhow::anyhow!("No processor groups detected"));
         }
-        let threads_per_group = (total_threads + num_groups - 1) / num_groups;
-        info!(target: LOG_TARGET_APP_LOGIC, "Multi-group mining: {} groups × {} threads/group", num_groups, threads_per_group);
+        let total_threads_for_mode = total_threads.saturating_mul(cpu_usage_percentage as usize).saturating_div(100);
+        let threads_per_group = (total_threads_for_mode + num_groups - 1) / num_groups;
+        info!(target: LOG_TARGET_APP_LOGIC, "Multi-group mining: {} groups × {} threads/group ({:.0}% of {} total)", num_groups, threads_per_group, cpu_usage_percentage as f64, total_threads);
 
         // Build extra options
         let extra_options = if cpu_usage_percentage <= 1 {

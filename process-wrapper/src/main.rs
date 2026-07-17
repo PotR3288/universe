@@ -92,15 +92,12 @@ fn main() {
     let binary_args = &remaining_args[2..];
 
     // On Windows, bind to the specified processor group before spawning child.
-    // Returns true if thread-level affinity was set (used for CREATE_FROZEN decision).
     #[cfg(windows)]
-    let affinity_set = if let Some(group) = group_index {
-        apply_group_affinity(group)
-    } else {
-        false
-    };
+    if let Some(group) = group_index {
+        apply_group_affinity(group);
+    }
 
-    let mut child = match spawn_child(binary, binary_args, #[cfg(windows)] affinity_set) {
+    let mut child = match spawn_child(binary, binary_args) {
         Ok(child) => child,
         Err(e) => {
             eprintln!("Failed to spawn child process: {}", e);
@@ -289,11 +286,8 @@ mod affinity_shim {
 ///
 /// Tries `SetProcessGroupAffinity` first (process-level). If that API is unavailable,
 /// falls back to `SetThreadGroupAffinity` applied to the current thread.
-/// Returns true if any form of affinity was successfully set — this signals that
-/// child processes should be spawned with CREATE_FROZEN so their primary thread
-/// inherits our thread-level affinity before executing.
 #[cfg(windows)]
-fn apply_group_affinity(group: u16) -> bool {
+fn apply_group_affinity(group: u16) {
     unsafe {
         let process_handle = windows_sys::Win32::System::Threading::GetCurrentProcess();
 
@@ -328,14 +322,14 @@ fn apply_group_affinity(group: u16) -> bool {
             eprintln!(
                 "[process-wrapper] Applied processor group affinity: group={group}",
             );
-            return true; // Process-level or thread-level affinity set.
+            return; // Process-level or thread-level affinity set.
         } else {
             let err = std::io::Error::last_os_error();
             eprintln!(
                 "[process-wrapper] Failed to apply processor group affinity: group={}, error={} (code {})",
                 group, err, err.raw_os_error().unwrap_or(-1)
             );
-            return false; // Neither process-level nor thread-level fallback succeeded.
+            return; // Neither process-level nor thread-level fallback succeeded.
         }
 
         // NOTE: process_handle is a pseudo-handle from GetCurrentProcess() — do NOT close it.
@@ -358,30 +352,25 @@ fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
 }
 
 #[cfg(windows)]
-fn spawn_child(binary: &str, args: &[String], affinity_set: bool) -> Result<Child, std::io::Error> {
+fn spawn_child(binary: &str, args: &[String]) -> Result<Child, std::io::Error> {
     use std::os::windows::process::CommandExt;
 
     // CREATE_NO_WINDOW: suppress console window for the child process.
     // CREATE_BREAKAWAY_FROM_JOB: allow the process to break away from any job object
     //    the parent is in, preventing the scheduler from throttling it.
-    // CREATE_FROZEN (0x10): create the process in a frozen state so the primary thread
-    //    inherits our thread-level affinity before executing. This is essential when
-    //    SetProcessGroupAffinity is unavailable — we set affinity on our own thread first,
-    //    then spawn with CREATE_FROZEN so the child's main thread starts with that affinity.
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
-    const CREATE_FROZEN: u32 = 0x00000010;
 
-    let mut flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
+    let flags = CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB;
 
-    // Use CREATE_FROZEN when we've set thread-level affinity (fallback for systems without SetProcessGroupAffinity)
-    if affinity_set {
-        flags |= CREATE_FROZEN;
-    }
-
+    // Redirect stdout/stderr to pipes so the child cannot inherit a visible console handle.
+    // This is essential on Windows — even with CREATE_NO_WINDOW, if the parent has an
+    // inherited console (e.g., from its own parent), the child may still display one.
     Command::new(binary)
         .args(args)
         .creation_flags(flags)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
 }
 

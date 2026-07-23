@@ -22,6 +22,11 @@
 
 use std::{sync::LazyLock, thread};
 
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Threading::{
+    GetActiveProcessorCount, GetMaximumProcessorGroupCount,
+};
+
 use log::{error, info};
 use tari_shutdown::Shutdown;
 use tauri::{AppHandle, Manager};
@@ -253,7 +258,12 @@ impl CpuManager {
                 self.process_watcher.adapter.cpu_threads =
                     Some(Self::determine_number_of_cores_to_use(cpu_usage_percentage).await);
 
-                self.process_watcher.adapter.extra_options = vec!["--randomx-mode=fast".to_string()]
+                self.process_watcher.adapter.extra_options = vec![
+                    "--randomx-mode=fast".to_string(),
+                    "--priority=5".to_string(),
+                    "--numa=true".to_string(),
+                    "--memory-pool=true".to_string(),
+                ]
             }
 
             self.process_watcher
@@ -281,18 +291,51 @@ impl CpuManager {
         self.process_watcher.is_running()
     }
 
+    /// Returns the total number of logical processors (threads) available,
+    /// correctly handling Windows processor groups (>64 CPUs).
+    ///
+    /// On Windows, `std::thread::available_parallelism()` only returns the count
+    /// for the first processor group (max 64 threads), which causes xmrig to
+    /// underutilize systems with more than 64 logical processors. This function
+    /// iterates every processor group via kernel32 APIs and sums their active
+    /// processor counts to get the true total.
+    #[allow(dead_code)]
+    fn total_logical_processors() -> u32 {
+        #[cfg(target_os = "windows")]
+        {
+            // GetMaximumProcessorGroupCount returns the maximum number of
+            // processor groups (usually 8 on modern Windows). We iterate each
+            // group index and sum GetActiveProcessorCount(group) to get the
+            // true total across all groups.
+            let max_groups = unsafe { GetMaximumProcessorGroupCount() };
+
+            if max_groups == 0 {
+                return 1;
+            }
+
+            let mut total: u32 = 0;
+            for group in 0..max_groups {
+                let count = unsafe { GetActiveProcessorCount(group) as u32 };
+                if count > 0 {
+                    total += count;
+                }
+            }
+
+            if total > 0 {
+                return total;
+            }
+        }
+
+        // Fallback for non-Windows or when Windows APIs return zero.
+        match thread::available_parallelism() {
+            Ok(n) => u32::try_from(n.get()).unwrap_or(1),
+            Err(_) => 1,
+        }
+    }
+
     async fn determine_number_of_cores_to_use(cpu_usage_percentage: u32) -> u32 {
-        let max_cpu_available = thread::available_parallelism();
-        let max_cpu_available = match max_cpu_available {
-            Ok(available_cpus) => {
-                info!(target:LOG_TARGET_APP_LOGIC, "Available CPU cores: {available_cpus}");
-                u32::try_from(available_cpus.get()).unwrap_or(1)
-            }
-            Err(err) => {
-                error!("Available CPU cores: Unknown, error: {err}");
-                1
-            }
-        };
+        let max_cpu_available = Self::total_logical_processors();
+        info!(target: LOG_TARGET_APP_LOGIC, "Available CPU cores: {max_cpu_available}");
 
         let cpu_cores_to_use = max_cpu_available
             .saturating_mul(cpu_usage_percentage)
